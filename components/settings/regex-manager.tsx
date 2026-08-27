@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useContext, useCallback, useMemo } from "react";
-import { Plus, Trash2, Download, Database, Play, Upload, ChevronLeft, AlertCircle, Maximize2, X } from "lucide-react";
+import { Plus, Trash2, Download, Database, Play, Upload, ChevronLeft, AlertCircle, Maximize2, X, Replace, Copy, Check } from "lucide-react";
 import {
     loadRegexes,
     saveRegexes,
@@ -17,8 +17,130 @@ import { buildCustomAppTagGroups, flattenTagGroups } from "@/lib/custom-app-tag-
 import { CUSTOM_APPS_UPDATED_EVENT, loadInstalledCustomApps } from "@/lib/custom-app-storage";
 import type { InstalledCustomApp } from "@/lib/custom-app-types";
 import { SettingsContext } from "../phone-settings-app";
-import { ConfirmDialog, TextExpandModal } from "@/components/ui/modal";
+import { BottomSheet, ConfirmDialog, TextExpandModal } from "@/components/ui/modal";
+import { SwipeActionRow, useSwipeActions } from "@/components/ui/swipe-actions";
 import { notifyMascotPageContext } from "@/lib/mascot-events";
+
+function copyTextToClipboard(text: string): void {
+    const fallbackCopy = () => {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;left:-9999px;top:-9999px;opacity:0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try { document.execCommand("copy"); } catch {}
+        document.body.removeChild(ta);
+    };
+    if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).catch(fallbackCopy);
+    } else {
+        fallbackCopy();
+    }
+}
+
+/** 复制「起效后的代码」（正则替换结果）的小按钮：点击后短暂显示「已复制」。 */
+function CopyCodeButton({ text, className }: { text: string; className?: string }) {
+    const [copied, setCopied] = useState(false);
+    return (
+        <button
+            type="button"
+            className={className}
+            disabled={!text}
+            title={text ? "复制起效后的代码" : "无内容可复制"}
+            onClick={(e) => {
+                e.stopPropagation();
+                copyTextToClipboard(text);
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1200);
+            }}
+            style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                border: "1px solid var(--c-panel-border)",
+                background: "var(--c-card)",
+                borderRadius: 8,
+                padding: "2px 8px",
+                cursor: text ? "pointer" : "not-allowed",
+                color: "var(--c-icon)",
+                opacity: text ? 1 : 0.4,
+                flexShrink: 0,
+            }}
+        >
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+            <span className="ts-11">{copied ? "已复制" : "复制"}</span>
+        </button>
+    );
+}
+
+/** 从 ```html 围栏里提取真正的 HTML 文档（渲染预览用）。 */
+function extractHtmlForPreview(text: string): string {
+    const m = text.match(/```html\s*\n([\s\S]*?)```/);
+    return m ? m[1].trim() : text.trim();
+}
+
+/**
+ * 渲染预览 iframe：与聊天里真正的 HTML 卡片同机制（iframe + 脚本可执行 + 高度自适应）。
+ * 之前的预览用 dangerouslySetInnerHTML 直接把 HTML 塞进当前文档：
+ * <style> 会生效、<script> 永不执行，导致带脚本的卡片只显示空壳、文字全丢。
+ */
+function HtmlPreviewFrame({ html }: { html: string }) {
+    const iframeRef = useRef<HTMLIFrameElement>(null);
+    const [height, setHeight] = useState(360);
+    const srcDoc = useMemo(() => {
+        const action = `document.addEventListener("click",function(e){var t=e.target.closest("[data-action]");if(t){e.preventDefault();window.parent.postMessage({type:"_chat_action",text:t.getAttribute("data-action")},"*")}},true);`;
+        const resize = `
+            var n=0;
+            var send=function(){
+                if(n>=12)return;
+                n++;
+                var b=document.body;
+                if(!b)return;
+                var h=Math.max(Math.ceil(b.getBoundingClientRect().height),b.scrollHeight||0,80);
+                window.parent.postMessage({type:"_chat_inline_html_resize",h:h},"*");
+            };
+            window.addEventListener("load",send);
+            if(window.ResizeObserver&&document.body){new ResizeObserver(function(){n=0;send();}).observe(document.body);}
+            document.addEventListener("toggle",function(){n=0;setTimeout(send,50);},true);
+            setTimeout(send,300);
+            setTimeout(send,1200);
+            setTimeout(send,2500);`;
+        const inject = `<script>(function(){${action}${resize}})();<\/script>`;
+        let h = html;
+        if (h.includes("</body>")) h = h.replace("</body>", inject + "</body>");
+        else h = h + inject;
+        return h;
+    }, [html]);
+
+    useEffect(() => {
+        setHeight(360);
+    }, [srcDoc]);
+
+    useEffect(() => {
+        const handler = (e: MessageEvent) => {
+            if (!e.data || typeof e.data !== "object") return;
+            if (iframeRef.current && e.source !== iframeRef.current.contentWindow) return;
+            if (e.data.type === "_chat_inline_html_resize" && typeof e.data.h === "number") {
+                setHeight(Math.max(80, Math.ceil(e.data.h)));
+            }
+        };
+        window.addEventListener("message", handler);
+        return () => window.removeEventListener("message", handler);
+    }, []);
+
+    return (
+        <iframe
+            ref={iframeRef}
+            srcDoc={srcDoc}
+            title="正则渲染预览"
+            // 与聊天卡片同规格的沙箱：脚本可跑但跨源隔离——正则组可从别人处导入，
+            // 预览内容不可信，不加 sandbox 会让脚本摸到主应用的 localStorage/IndexedDB
+            sandbox="allow-scripts"
+            style={{ width: "100%", height, border: "none", borderRadius: 12, background: "transparent" }}
+        />
+    );
+}
 
 function getRuleTags(rule: Pick<RegexRule, "tags">): string[] {
     return rule.tags && rule.tags.length > 0 ? [...rule.tags] : [];
@@ -261,19 +383,130 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
 
     const visibleRules = activeGroup?.rules || [];
 
+    // ── 规则左滑操作（微信式：左滑露出「新增/删除」） ──
+    const swipe = useSwipeActions();
+
+    const makeNewRule = (): RegexRule => ({
+        id: `regex-rule-${Date.now()}`,
+        scriptName: "新正则规则",
+        findRegex: "",
+        replaceString: "",
+        disabled: false,
+        placement: [1],
+        tags: [...DEFAULT_REGEX_TAGS],
+    });
+
     const addRule = () => {
         if (!activeGroup) return;
-        const newRule: RegexRule = {
-            id: `regex-rule-${Date.now()}`,
-            scriptName: "新正则规则",
-            findRegex: "",
-            replaceString: "",
-            disabled: false,
-            placement: [1],
-            tags: [...DEFAULT_REGEX_TAGS],
-        };
+        const newRule = makeNewRule();
         updateGroup(activeGroup.id, { rules: [newRule, ...(activeGroup.rules || [])] });
         setEditingRuleId(newRule.id);
+    };
+
+    const insertRuleAfter = (afterId: string) => {
+        if (!activeGroup) return;
+        const newRule = makeNewRule();
+        const rules = [...(activeGroup.rules || [])];
+        const idx = rules.findIndex(r => r.id === afterId);
+        if (idx >= 0) rules.splice(idx + 1, 0, newRule);
+        else rules.push(newRule);
+        updateGroup(activeGroup.id, { rules });
+        swipe.close();
+        setEditingRuleId(newRule.id);
+        window.setTimeout(() => {
+            rxContainerRef.current
+                ?.querySelector(`[data-swipe-id="${CSS.escape(newRule.id)}"]`)
+                ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 80);
+    };
+
+    // ── 规则级导入/导出（左滑「替换/导出」+ 底部「添加条目」菜单） ──
+    const [addRuleMenuOpen, setAddRuleMenuOpen] = useState(false);
+    const ruleFileInputRef = useRef<HTMLInputElement>(null);
+    const ruleImportModeRef = useRef<{ mode: "append" } | { mode: "replace"; id: string } | null>(null);
+
+    const sanitizeRuleImport = (raw: unknown, fallbackId: string): RegexRule | null => {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+        const obj = raw as Record<string, unknown>;
+        if (typeof obj.findRegex !== "string" && typeof obj.scriptName !== "string") return null;
+        const placement = Array.isArray(obj.placement)
+            ? obj.placement.filter((v): v is number => typeof v === "number")
+            : [];
+        const rule: RegexRule = {
+            id: fallbackId,
+            scriptName: typeof obj.scriptName === "string" ? obj.scriptName : "导入的规则",
+            findRegex: typeof obj.findRegex === "string" ? obj.findRegex : "",
+            replaceString: typeof obj.replaceString === "string" ? obj.replaceString : "",
+            disabled: !!obj.disabled,
+            placement: placement.length > 0 ? placement : [1],
+        };
+        if (Array.isArray(obj.tags)) rule.tags = obj.tags.filter((t): t is string => typeof t === "string");
+        if (Array.isArray(obj.trimStrings)) rule.trimStrings = obj.trimStrings.filter((t): t is string => typeof t === "string");
+        if (typeof obj.markdownOnly === "boolean") rule.markdownOnly = obj.markdownOnly;
+        if (typeof obj.promptOnly === "boolean") rule.promptOnly = obj.promptOnly;
+        if (typeof obj.runOnEdit === "boolean") rule.runOnEdit = obj.runOnEdit;
+        if (typeof obj.historyOnly === "boolean") rule.historyOnly = obj.historyOnly;
+        if (typeof obj.substituteRegex === "number") rule.substituteRegex = obj.substituteRegex;
+        if (typeof obj.minDepth === "number") rule.minDepth = obj.minDepth;
+        if (typeof obj.maxDepth === "number") rule.maxDepth = obj.maxDepth;
+        return normalizeRuleScope(rule);
+    };
+
+    const appendImportedRules = (group: RegexConfig, raws: unknown[]) => {
+        const base = Date.now();
+        const appended = raws
+            .map((raw, i) => sanitizeRuleImport(raw, `regex-rule-${base + i}`))
+            .filter((rule): rule is RegexRule => !!rule);
+        if (appended.length === 0) {
+            setImportError("JSON 里没有可识别的规则内容。");
+            return;
+        }
+        updateGroup(group.id, { rules: [...(group.rules || []), ...appended] });
+        if (appended.length === 1) setEditingRuleId(appended[0].id);
+        window.setTimeout(() => {
+            rxContainerRef.current
+                ?.querySelector(`[data-swipe-id="${CSS.escape(appended[0].id)}"]`)
+                ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 80);
+    };
+
+    const replaceImportedRule = (group: RegexConfig, targetId: string, raw: unknown) => {
+        const sanitized = sanitizeRuleImport(raw, targetId);
+        if (!sanitized) {
+            setImportError("JSON 里没有可识别的规则内容。");
+            return;
+        }
+        // 保留原 id，只替换内容
+        const finalRule = { ...sanitized, id: targetId };
+        updateGroup(group.id, { rules: (group.rules || []).map(r => r.id === targetId ? finalRule : r) });
+    };
+
+    const exportRule = async (rule: RegexRule) => {
+        const { downloadFile } = await import("@/lib/download-utils");
+        const blob = new Blob([JSON.stringify(rule, null, 2)], { type: "application/json" });
+        await downloadFile(blob, `${rule.scriptName || "regex-rule"}.json`);
+    };
+
+    const handleRuleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        const mode = ruleImportModeRef.current;
+        ruleImportModeRef.current = null;
+        if (ruleFileInputRef.current) ruleFileInputRef.current.value = "";
+        if (!file || !mode) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const group = groups.find(g => g.id === activeGroupId);
+            if (!group) return;
+            try {
+                const parsed = JSON.parse(event.target?.result as string);
+                const items = Array.isArray(parsed) ? parsed : [parsed];
+                if (mode.mode === "replace") replaceImportedRule(group, mode.id, items[0]);
+                else appendImportedRules(group, items);
+            } catch {
+                setImportError("无法解析规则文件，格式不正确。");
+            }
+        };
+        reader.readAsText(file);
     };
 
     const updateRule = (id: string, updates: Partial<RegexRule>) => {
@@ -299,6 +532,7 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
     return (
         <div ref={rxContainerRef} className="flex flex-col gap-5 h-full">
             <input type="file" accept=".json" className="hidden" ref={fileInputRef} onChange={handleImport} />
+            <input type="file" accept=".json" className="hidden" ref={ruleFileInputRef} onChange={handleRuleImportFile} />
             {viewMode === "list" ? (
                 <>
                     <div className="flex items-center">
@@ -457,8 +691,13 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                                     {step.skipped && <span className="ts-11" style={{ color: "var(--c-icon)", opacity: 0.6 }}>{step.skipped}</span>}
                                                                 </button>
                                                                 {groupTestExpandStep === i && !step.skipped && (
-                                                                    <div className="ui-code-block" style={{ maxHeight: 200, overflow: "auto", whiteSpace: "pre-wrap", fontSize: "calc(12px*var(--app-text-scale,1))", margin: "4px 0 8px" }}>
-                                                                        {step.output || <span className="menu-desc !mt-0">(空)</span>}
+                                                                    <div className="flex flex-col gap-1" style={{ margin: "4px 0 8px" }}>
+                                                                        <div className="flex items-center justify-end">
+                                                                            <CopyCodeButton text={step.output} />
+                                                                        </div>
+                                                                        <div className="ui-code-block" style={{ maxHeight: 200, overflow: "auto", whiteSpace: "pre-wrap", fontSize: "calc(12px*var(--app-text-scale,1))" }}>
+                                                                            {step.output || <span className="menu-desc !mt-0">(空)</span>}
+                                                                        </div>
                                                                     </div>
                                                                 )}
                                                             </div>
@@ -466,7 +705,10 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                     </div>
                                                 </div>
                                                 <div className="flex flex-col gap-1">
-                                                    <label className="menu-desc">最终输出</label>
+                                                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                                                        <label className="menu-desc !mt-0">最终输出</label>
+                                                        <CopyCodeButton text={groupOutput} />
+                                                    </div>
                                                     <div className="ui-code-block" style={{ maxHeight: 300, overflow: "auto", whiteSpace: "pre-wrap", fontSize: "calc(13px*var(--app-text-scale,1))" }}>
                                                         {groupOutput || <span className="menu-desc !mt-0">(空)</span>}
                                                     </div>
@@ -495,8 +737,63 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                         const isEditing = editingRuleId === rule.id;
 
                                         return (
-                                            <div
+                                            <SwipeActionRow
                                                 key={rule.id}
+                                                controller={swipe}
+                                                id={rule.id}
+                                                disabled={isEditing}
+                                                actions={
+                                                    <>
+                                                        <button
+                                                            type="button"
+                                                            className="ui-swipe-action"
+                                                            data-variant="insert"
+                                                            onClick={() => insertRuleAfter(rule.id)}
+                                                        >
+                                                            <Plus size={18} strokeWidth={2} />
+                                                            <span>新增</span>
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className="ui-swipe-action"
+                                                            data-variant="replace"
+                                                            onClick={() => {
+                                                                ruleImportModeRef.current = { mode: "replace", id: rule.id };
+                                                                ruleFileInputRef.current?.click();
+                                                                swipe.close();
+                                                            }}
+                                                        >
+                                                            <Replace size={18} strokeWidth={2} />
+                                                            <span>替换</span>
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className="ui-swipe-action"
+                                                            data-variant="export"
+                                                            onClick={() => {
+                                                                exportRule(rule);
+                                                                swipe.close();
+                                                            }}
+                                                        >
+                                                            <Download size={18} strokeWidth={2} />
+                                                            <span>导出</span>
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className="ui-swipe-action"
+                                                            data-variant="delete"
+                                                            onClick={() => {
+                                                                setConfirmDeleteTarget({ type: 'rule', id: rule.id });
+                                                                swipe.close();
+                                                            }}
+                                                        >
+                                                            <Trash2 size={18} strokeWidth={2} />
+                                                            <span>删除</span>
+                                                        </button>
+                                                    </>
+                                                }
+                                            >
+                                            <div
                                                 className="ui-entry-card"
                                                 data-active={isEditing ? "true" : undefined}
                                                 data-disabled={rule.disabled && !isEditing ? "true" : undefined}
@@ -504,7 +801,14 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                             >
                                                 <div className="flex justify-between items-start">
                                                     <button
-                                                        onClick={() => setEditingRuleId(isEditing ? null : rule.id)}
+                                                        onClick={() => {
+                                                            if (swipe.consumeClickSuppression()) return;
+                                                            if (swipe.openId || swipe.swipingId) {
+                                                                swipe.close();
+                                                                return;
+                                                            }
+                                                            setEditingRuleId(isEditing ? null : rule.id);
+                                                        }}
                                                         className="flex gap-3 flex-1 bg-none border-none text-left cursor-pointer p-0"
                                                     >
                                                         <div className="mt-0.5 ui-entry-icon">
@@ -540,13 +844,6 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                             />
                                                             <span className="ui-mini-toggle-thumb" />
                                                         </label>
-                                                        <button
-                                                            onClick={() => setConfirmDeleteTarget({ type: 'rule', id: rule.id })}
-                                                            className="ui-link-btn"
-                                                            data-variant="danger"
-                                                        >
-                                                            <Trash2 size={18} />
-                                                        </button>
                                                     </div>
                                                 </div>
 
@@ -599,20 +896,30 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                                     [2, "AI 输出"],
                                                                     [5, "世界书"],
                                                                     [6, "思维链"],
-                                                                ] as const).map(([val, label]) => (
-                                                                    <label key={val} className="ui-checkbox-label whitespace-nowrap">
-                                                                        <input
-                                                                            type="checkbox"
-                                                                            checked={rule.placement?.includes(val) ?? false}
-                                                                            onChange={(e) => {
-                                                                                const p = new Set(rule.placement || []);
-                                                                                e.target.checked ? p.add(val) : p.delete(val);
-                                                                                updateRule(rule.id, { placement: [...p] });
-                                                                            }}
-                                                                        />
-                                                                        {label}
-                                                                    </label>
-                                                                ))}
+                                                                ] as const).map(([val, label]) => {
+                                                                    // 「仅历史消息」只有在组装提示词（用户输入）这一环才拿得到历史标记，
+                                                                    // 勾在别的环节上规则会彻底不触发——所以开着它时锁死为「用户输入」
+                                                                    const lockedToInput = rule.historyOnly === true;
+                                                                    return (
+                                                                        <label
+                                                                            key={val}
+                                                                            className="ui-checkbox-label whitespace-nowrap"
+                                                                            style={lockedToInput && val !== 1 ? { opacity: 0.35 } : undefined}
+                                                                        >
+                                                                            <input
+                                                                                type="checkbox"
+                                                                                checked={lockedToInput ? val === 1 : (rule.placement?.includes(val) ?? false)}
+                                                                                disabled={lockedToInput}
+                                                                                onChange={(e) => {
+                                                                                    const p = new Set(rule.placement || []);
+                                                                                    e.target.checked ? p.add(val) : p.delete(val);
+                                                                                    updateRule(rule.id, { placement: [...p] });
+                                                                                }}
+                                                                            />
+                                                                            {label}
+                                                                        </label>
+                                                                    );
+                                                                })}
                                                             </div>
                                                         </div>
 
@@ -634,6 +941,17 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                                         onChange={(e) => updateRule(rule.id, { runOnEdit: e.target.checked || undefined })} />
                                                                     编辑时执行
                                                                 </label>
+                                                            </div>
+                                                            <div className="flex items-center justify-between gap-6 mt-2">
+                                                                <label className="ui-checkbox-label whitespace-nowrap">
+                                                                    <input type="checkbox" checked={rule.historyOnly ?? false}
+                                                                        onChange={(e) => updateRule(rule.id, e.target.checked
+                                                                            // 勾上即锁定为「用户输入」：这是它唯一能生效的环节
+                                                                            ? { historyOnly: true, placement: [1] }
+                                                                            : { historyOnly: undefined })} />
+                                                                    仅历史消息
+                                                                </label>
+                                                                <span className="menu-desc !mt-0">只作用于聊天历史消息，不碰系统提示词/预设/世界书</span>
                                                             </div>
                                                         </div>
 
@@ -735,6 +1053,8 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                                                 <span className="ui-tag" data-variant={matchCount > 0 ? "success" : "muted"}>
                                                                                     {matchCount > 0 ? `${matchCount} 处匹配` : "无匹配"}
                                                                                 </span>
+                                                                                <span className="flex-1" />
+                                                                                <CopyCodeButton text={output} />
                                                                             </div>
                                                                             <div className="ui-code-block">{output || <span className="menu-desc !mt-0">(空)</span>}</div>
                                                                         </div>
@@ -753,6 +1073,7 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                                                     </div>
                                                 )}
                                             </div>
+                                            </SwipeActionRow>
                                         )
                                     })
                                 )}
@@ -760,7 +1081,7 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
 
                             <button
                                 type="button"
-                                onClick={addRule}
+                                onClick={() => setAddRuleMenuOpen(true)}
                                 className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-[20px] bg-black px-4 text-xs font-bold text-white shadow-sm transition-all hover:bg-gray-800 hover:shadow-md active:scale-95 focus:outline-none"
                             >
                                 <Plus size={15} strokeWidth={1.8} />
@@ -805,6 +1126,34 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                 />
             )}
 
+            {addRuleMenuOpen && activeGroup && (
+                <BottomSheet title="添加条目" onClose={() => setAddRuleMenuOpen(false)}>
+                    <div className="flex flex-col gap-2">
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-primary w-full"
+                            onClick={() => {
+                                setAddRuleMenuOpen(false);
+                                addRule();
+                            }}
+                        >
+                            <Plus size={16} /> 直接创建
+                        </button>
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline w-full"
+                            onClick={() => {
+                                setAddRuleMenuOpen(false);
+                                ruleImportModeRef.current = { mode: "append" };
+                                ruleFileInputRef.current?.click();
+                            }}
+                        >
+                            <Upload size={16} /> 从 JSON 文件导入
+                        </button>
+                    </div>
+                </BottomSheet>
+            )}
+
             {expandTarget && (() => {
                 const rule = activeGroup?.rules?.find(r => r.id === expandTarget.ruleId);
                 if (!rule) return null;
@@ -830,7 +1179,7 @@ export function RegexManager({ isActive = true }: { isActive?: boolean } = {}) {
                         </button>
                     </header>
                     <div className="flex-1 overflow-auto p-4">
-                        <div className="chat-markdown" dangerouslySetInnerHTML={{ __html: previewHtml }} />
+                        <HtmlPreviewFrame html={extractHtmlForPreview(previewHtml)} />
                     </div>
                 </div>
             )}

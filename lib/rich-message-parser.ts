@@ -42,6 +42,19 @@ export interface ParsedAIResponse {
 
 // ── Rich-media patterns (non-global, for single match with index) ──
 
+// 零宽空格/BOM 等不可见字符不属于 \s，trim() 删不掉；模型输出在媒体标记后夹带
+// 这类字符时，会被切成一个"非空但渲染不可见"的段落，最终显示成一个空气泡。
+// 不能直接从内容里删除这些字符——U+200D 是组合 emoji 的连接符，U+200C 在部分
+// 文字里有语义——所以只在"判空"时把它们视同空白。
+const INVISIBLE_OR_WHITESPACE_ONLY_RE = new RegExp(
+    "^[\\s\\u00AD\\u034F\\u180E\\u200B-\\u200F\\u2060-\\u2064\\uFEFF]*$",
+);
+
+/** 内容是否没有任何可见字符（空串、空白、零宽字符/BOM 等的任意组合） */
+export function isInvisibleOrWhitespaceOnly(text: string): boolean {
+    return INVISIBLE_OR_WHITESPACE_ONLY_RE.test(text);
+}
+
 const C = "\\s*[：:]\\s*"; // half-width or full-width colon, allowing surrounding spaces
 
 function parseMuteMinutes(num?: string, unit?: string): number {
@@ -584,8 +597,13 @@ export function parseAIResponse(rawText: string, previousState: StateValue[]): P
         htmlBlockPlaceholders.push({ placeholder, original: match });
         return placeholder;
     });
-    // Protect <style>...</style> and following HTML until next double-newline + non-HTML
-    protected_ = protected_.replace(/<style[\s\S]*?<\/style>[\s\S]*?(?=\n\n[^<\x00]|$)/gi, (match) => {
+    // Protect <style>...</style> and following HTML until next double-newline + non-HTML,
+    // 或者撞上 [/状态栏]、[/内心] 的闭合标签。
+    // 闭合标签这一支不能省：AI 按契约在 [状态栏] 里直出 HTML 时，HTML 和闭合标签之间
+    // 通常只有单换行、没有空行可停，保护段就会一路吞到 $——把 [/状态栏] 连同它后面的
+    // 聊天正文一起卷进占位符。闭合标签在下面 extractBracketBlock 跑之前就没了，状态栏
+    // 提取不到，整块连标签带 HTML 全泄进气泡。（"要空一行才正常"就是撞的这里。）
+    protected_ = protected_.replace(/<style[\s\S]*?<\/style>[\s\S]*?(?=\n\n[^<\x00]|\s*\[\/(?:状态栏|内心)\]|$)/gi, (match) => {
         const placeholder = `\x00HTML_BLOCK_${htmlBlockPlaceholders.length}\x00`;
         htmlBlockPlaceholders.push({ placeholder, original: match });
         return placeholder;
@@ -641,7 +659,7 @@ export function parseAIResponse(rawText: string, previousState: StateValue[]): P
         if (p.mediaType) return p;
         const display = stripTextToolDirectives(restore(p.content));
         return { ...p, content: display };
-    }).filter(p => p.mediaType || p.content);
+    }).filter(p => p.mediaType || !isInvisibleOrWhitespaceOnly(p.content));
 
     return {
         parts: cleaned,

@@ -1,10 +1,16 @@
 import { DOCK_DEFAULT, type DesktopIconId, type IconPosition } from "@/lib/desktop-config";
 import {
+  appendMissingCustomAppIcons,
   createDefaultDesktopIconLayout,
   getDesktopIconLayoutItems,
+  loadDesktopFolders,
+  loadDockLayout,
+  normalizeDesktopFolders,
   normalizeDesktopIconLayout,
+  normalizeDock,
   writeDesktopIconLayout,
   writeDockLayout,
+  type DesktopFolderMap,
   type DesktopIconLayout
 } from "@/lib/desktop-layout-storage";
 import { DEFAULT_THEME_PROFILE, normalizeThemeProfile, type ThemeAssetType, type ThemeProfile } from "@/lib/theme-types";
@@ -52,6 +58,9 @@ type ThemePackageManifest = {
     iconLayout: DesktopIconLayout;
     widgets: WidgetInstance[];
     diyTemplates: DIYWidgetTemplate[];
+    /** v1 后补的可选字段（旧包没有）：dock 与文件夹随包走，导入不再丢 */
+    dock?: DesktopIconId[];
+    folders?: DesktopFolderMap;
   };
   assets: ThemePackageAssetEntry[];
 };
@@ -71,8 +80,10 @@ export type InstalledThemePackage = {
   widgets: WidgetInstance[];
   diyTemplates: DIYWidgetTemplate[];
   summary: ThemePackageSummary;
-  /** 恢复默认时重置后的 dock；主题包导入不含 dock（保留用户当前 dock）时为 undefined */
+  /** 恢复默认时重置后的 dock；旧主题包不含 dock（保留用户当前 dock）时为 undefined */
   dock?: DesktopIconId[];
+  /** 包里带的文件夹表；旧包没有时为 undefined（桌面按无文件夹处理） */
+  folders?: DesktopFolderMap;
 };
 
 export type CreateThemePackageInput = {
@@ -273,7 +284,11 @@ function normalizeManifest(raw: unknown): ThemePackageManifest {
   const desktop = candidate.desktop && typeof candidate.desktop === "object"
     ? (candidate.desktop as Record<string, unknown>)
     : {};
-  const iconLayout = normalizeDesktopIconLayout(desktop.iconLayout);
+  // 文件夹先归一（成员按本机已装过滤），布局归一时放行它们的 tile——
+  // 否则 folder tile 会被当成不认识的图标丢掉，整夹内容随之蒸发
+  const folders = desktop.folders !== undefined ? normalizeDesktopFolders(desktop.folders) : undefined;
+  const iconLayout = normalizeDesktopIconLayout(desktop.iconLayout, folders ? new Set(Object.keys(folders)) : undefined);
+  const dock = desktop.dock !== undefined ? normalizeDock(desktop.dock) : undefined;
   const widgets = normalizeWidgets(desktop.widgets);
   const diyTemplates = normalizeDIYTemplates(desktop.diyTemplates);
   const themeProfile = normalizeThemeProfile(candidate.themeProfile);
@@ -286,7 +301,9 @@ function normalizeManifest(raw: unknown): ThemePackageManifest {
     desktop: {
       iconLayout,
       widgets,
-      diyTemplates
+      diyTemplates,
+      dock,
+      folders
     },
     assets: normalizeAssetEntries(candidate.assets)
   };
@@ -393,15 +410,20 @@ export async function createThemePackageBlob(input: CreateThemePackageInput): Pr
     zip.file(assets[index].path, dataUrlBase64(record.dataUrl), { base64: true });
   });
 
+  // dock 与文件夹随包走：布局里的 folder tile 要靠文件夹表才放得行，
+  // 不带的话导出即丢（tile 被归一化过滤、成员没处可查）
+  const exportFolders = loadDesktopFolders();
   const manifest: ThemePackageManifest = {
     schema: PACKAGE_SCHEMA,
     version: PACKAGE_VERSION,
     exportedAt: new Date().toISOString(),
     themeProfile,
     desktop: {
-      iconLayout: normalizeDesktopIconLayout(input.iconLayout),
+      iconLayout: normalizeDesktopIconLayout(input.iconLayout, new Set(Object.keys(exportFolders))),
       widgets: normalizeWidgets(input.widgets),
-      diyTemplates
+      diyTemplates,
+      dock: loadDockLayout(),
+      folders: exportFolders
     },
     assets
   };
@@ -424,6 +446,13 @@ export async function inspectThemePackageFile(file: File): Promise<ThemePackageS
   const { manifest } = await loadZip(file);
   return makeSummary(manifest);
 }
+
+/**
+ * 主题包已装好、请桌面刷新（detail 带 installThemePackageFile 的返回值）。
+ * 资源集市在 lib 里够不着外观页那两个 React 回调，改派这个事件，
+ * 桌面 shell 走与外观页导入完全相同的落地路径。
+ */
+export const THEME_PACKAGE_INSTALLED_EVENT = "ai-phone-theme-package-installed";
 
 export async function installThemePackageFile(file: File): Promise<InstalledThemePackage> {
   const { zip, manifest } = await loadZip(file);
@@ -448,13 +477,23 @@ export async function installThemePackageFile(file: File): Promise<InstalledThem
   const themeProfile = writeThemeProfile(manifest.themeProfile);
   saveDIYTemplates(manifest.desktop.diyTemplates);
   saveWidgets(manifest.desktop.widgets);
-  const iconLayout = writeDesktopIconLayout(manifest.desktop.iconLayout);
+  // 主题包布局不含本机安装的自定义 app 图标，补回空位，避免导入后 app 从桌面消失
+  const packageDock = manifest.desktop.dock ?? loadDockLayout();
+  const packageFolderIds = manifest.desktop.folders ? new Set(Object.keys(manifest.desktop.folders)) : undefined;
+  // 补自定义 app 图标时，藏在包内文件夹里的成员也算"已在桌面"，别铺重复的
+  const folderMembers = Object.values(manifest.desktop.folders ?? {}).flatMap((f) => f.icons);
+  const iconLayout = writeDesktopIconLayout(
+    appendMissingCustomAppIcons(manifest.desktop.iconLayout, manifest.desktop.widgets, [...packageDock, ...folderMembers]),
+    packageFolderIds
+  );
 
   return {
     themeProfile,
     iconLayout,
     widgets: manifest.desktop.widgets,
     diyTemplates: manifest.desktop.diyTemplates,
+    dock: manifest.desktop.dock,
+    folders: manifest.desktop.folders,
     summary: makeSummary(manifest)
   };
 }
@@ -471,9 +510,12 @@ export async function resetThemePackageState(): Promise<InstalledThemePackage> {
     wallpaperLibrary: previousProfile.wallpaperLibrary
   });
   const widgets = createDefaultWidgets();
-  const iconLayout = writeDesktopIconLayout(createDefaultDesktopIconLayout(widgets));
   // dock 一并恢复出厂，否则被拖出 dock 的默认图标（如设置）会在重置后彻底丢失
   const dock = writeDockLayout([...DOCK_DEFAULT]);
+  // 出厂布局只含内置图标，把已安装的自定义 app 图标补回空位，避免重置后 app 从桌面消失
+  const iconLayout = writeDesktopIconLayout(
+    appendMissingCustomAppIcons(createDefaultDesktopIconLayout(widgets), widgets, dock)
+  );
   saveDIYTemplates(previousTemplates);
   saveWidgets(widgets);
 
@@ -482,6 +524,7 @@ export async function resetThemePackageState(): Promise<InstalledThemePackage> {
     iconLayout,
     widgets,
     dock,
+    folders: {},
     diyTemplates: previousTemplates,
     summary: {
       assetCount: previousProfile.wallpaperLibrary.length + collectDIYTemplateAssetIds(previousTemplates).length,
