@@ -7,6 +7,7 @@ import { kvGet, kvSet, registerKvMigration } from "./kv-db";
 export const ICON_LAYOUT_STORAGE_KEY = "ai_phone_icon_layout_v2";
 export const ICON_LAYOUT_STORAGE_KEY_V1 = "ai_phone_icon_layout_v1";
 export const DOCK_LAYOUT_STORAGE_KEY = "ai_phone_dock_layout_v1";
+export const DESKTOP_FOLDERS_STORAGE_KEY = "ai_phone_desktop_folders_v1";
 
 /** Max icons the dock can hold. Dragging a page icon in is rejected once full. */
 export const DOCK_MAX = 4;
@@ -14,6 +15,7 @@ export const DOCK_MAX = 4;
 registerKvMigration(ICON_LAYOUT_STORAGE_KEY);
 registerKvMigration(ICON_LAYOUT_STORAGE_KEY_V1);
 registerKvMigration(DOCK_LAYOUT_STORAGE_KEY);
+registerKvMigration(DESKTOP_FOLDERS_STORAGE_KEY);
 
 export type DesktopPageKey = `page${number}`;
 
@@ -101,21 +103,22 @@ export function createDefaultDesktopIconLayout(_widgets: WidgetInstance[] = []):
       row: 5 + Math.floor(i / GRID_COLS),
       col: (i % GRID_COLS) + 1,
     })),
+    // 第二页：第 4 行留给 iOS 操作菜单组件，图标从第 5 行开始
     page2: PAGE_2_DEFAULT.map((id, i) => ({
       id,
-      row: 4 + Math.floor(i / GRID_COLS),
+      row: 5 + Math.floor(i / GRID_COLS),
       col: (i % GRID_COLS) + 1,
     })),
-    // 第三页：水平居中排在中间那行（第 3 行）。单个图标居中于 col2，两个则 col2、col3。
+    // 第三页：右半边 2×2（第 4~5 行、第 3~4 列），左半边留给日历组件
     page3: PAGE_3_DEFAULT.map((id, i) => ({
       id,
-      row: 3,
-      col: Math.floor((GRID_COLS - PAGE_3_DEFAULT.length) / 2) + 1 + i,
+      row: 4 + Math.floor(i / 2),
+      col: 3 + (i % 2),
     })),
   } as DesktopIconLayout;
 }
 
-function normalizePage(raw: unknown): IconPosition[] {
+function normalizePage(raw: unknown, folderIds?: Set<string>): IconPosition[] {
   if (!Array.isArray(raw)) {
     return [];
   }
@@ -135,10 +138,12 @@ function normalizePage(raw: unknown): IconPosition[] {
     if (typeof id !== "string" || typeof row !== "number" || typeof col !== "number") {
       continue;
     }
-    const migratedId = migrateLegacyDesktopIconId(id, customIconIds);
+    // 文件夹 tile：随附文件夹表的调用方（主题包导出/导入）显式放行，
+    // 否则照旧丢弃——没有成员表的 folder tile 是空壳
+    const migratedId = folderIds?.has(id) ? (id as DesktopIconId) : migrateLegacyDesktopIconId(id, customIconIds);
     if (
       !migratedId
-      || (!knownIcons.has(migratedId) && !customIconIds.has(migratedId))
+      || (!knownIcons.has(migratedId) && !customIconIds.has(migratedId) && !folderIds?.has(migratedId))
       || row < 1
       || row > GRID_ROWS
       || col < 1
@@ -161,7 +166,7 @@ function normalizePage(raw: unknown): IconPosition[] {
   return result;
 }
 
-export function normalizeDesktopIconLayout(raw: unknown): DesktopIconLayout {
+export function normalizeDesktopIconLayout(raw: unknown, folderIds?: Set<string>): DesktopIconLayout {
   if (!raw || typeof raw !== "object") {
     return createDefaultDesktopIconLayout();
   }
@@ -169,15 +174,112 @@ export function normalizeDesktopIconLayout(raw: unknown): DesktopIconLayout {
   const candidate = raw as Record<string, unknown>;
   const normalized = {} as DesktopIconLayout;
   for (const pageKey of getDesktopPageKeys(candidate)) {
-    normalized[pageKey] = normalizePage(candidate[pageKey]);
+    normalized[pageKey] = normalizePage(candidate[pageKey], folderIds);
   }
   return normalized;
 }
 
-export function writeDesktopIconLayout(layout: DesktopIconLayout): DesktopIconLayout {
-  const normalized = normalizeDesktopIconLayout(layout);
+export function writeDesktopIconLayout(layout: DesktopIconLayout, folderIds?: Set<string>): DesktopIconLayout {
+  const normalized = normalizeDesktopIconLayout(layout, folderIds);
   kvSet(ICON_LAYOUT_STORAGE_KEY, JSON.stringify(normalized));
   return normalized;
+}
+
+/**
+ * 把已安装但没出现在布局或 dock 里的自定义 app 图标补回桌面空位。
+ * 恢复默认外观、导入主题包时图标布局会被整体覆盖，若不补回，
+ * 已安装的自定义 app 会从桌面上消失（app 本体仍在，只是没有图标可点）。
+ */
+export function appendMissingCustomAppIcons(
+  layout: DesktopIconLayout,
+  widgets: WidgetInstance[] = [],
+  dock: DesktopIconId[] = []
+): DesktopIconLayout {
+  const present = new Set<string>(dock);
+  for (const icon of getDesktopIconLayoutItems(layout)) {
+    present.add(icon.id);
+  }
+  const missing = Array.from(getInstalledCustomIconIds()).filter((id) => !present.has(id)) as DesktopIconId[];
+  if (missing.length === 0) {
+    return layout;
+  }
+
+  const next = { ...layout } as DesktopIconLayout;
+  let index = 0;
+  // 页面满（含组件占位）就顺延到下一页；上限只是防御性兜底，不会实际触达。
+  for (let page = 1; index < missing.length && page <= 50; page++) {
+    const pageKey = getDesktopPageKey(page);
+    const icons = next[pageKey] ?? [];
+    const occupied = buildWidgetOccupancy(widgets, page);
+    for (const icon of icons) {
+      if (icon.row >= 1 && icon.row <= GRID_ROWS && icon.col >= 1 && icon.col <= GRID_COLS) {
+        occupied[icon.row - 1][icon.col - 1] = true;
+      }
+    }
+    const placed: IconPosition[] = [];
+    for (let row = 0; row < GRID_ROWS && index < missing.length; row++) {
+      for (let col = 0; col < GRID_COLS && index < missing.length; col++) {
+        if (occupied[row][col]) {
+          continue;
+        }
+        placed.push({ id: missing[index], row: row + 1, col: col + 1 });
+        index++;
+      }
+    }
+    if (placed.length > 0) {
+      next[pageKey] = [...icons, ...placed];
+    }
+  }
+  return next;
+}
+
+// ── Desktop folders ───────────────────────────────────
+// 文件夹内容表：folder:xxx → { name, icons }。tile 本身作为普通图标
+// 存在分页布局里；这张表只管"里面装了什么、叫什么"。
+
+export type DesktopFolder = { name: string; icons: DesktopIconId[] };
+export type DesktopFolderMap = Record<string, DesktopFolder>;
+
+/** 校验并去重文件夹表：只保留已知/已安装的成员图标（文件夹不可嵌套） */
+export function normalizeDesktopFolders(raw: unknown): DesktopFolderMap {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const knownIcons = new Set<string>(Object.keys(ICONS));
+  const customIconIds = getInstalledCustomIconIds();
+  const seen = new Set<string>();
+  const result: DesktopFolderMap = {};
+  for (const [folderId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!folderId.startsWith("folder:") || !value || typeof value !== "object") continue;
+    const { name, icons } = value as { name?: unknown; icons?: unknown };
+    if (!Array.isArray(icons)) continue;
+    const members: DesktopIconId[] = [];
+    for (const item of icons) {
+      if (typeof item !== "string" || item.startsWith("folder:")) continue;
+      const migratedId = migrateLegacyDesktopIconId(item, customIconIds);
+      if (!migratedId || (!knownIcons.has(migratedId) && !customIconIds.has(migratedId))) continue;
+      if (seen.has(migratedId) || members.includes(migratedId)) continue;
+      seen.add(migratedId);
+      members.push(migratedId);
+    }
+    result[folderId] = {
+      name: typeof name === "string" && name.trim() ? name.trim().slice(0, 24) : "文件夹",
+      icons: members,
+    };
+  }
+  return result;
+}
+
+export function loadDesktopFolders(): DesktopFolderMap {
+  const raw = kvGet(DESKTOP_FOLDERS_STORAGE_KEY);
+  if (raw == null) return {};
+  try {
+    return normalizeDesktopFolders(JSON.parse(raw));
+  } catch {
+    return {};
+  }
+}
+
+export function writeDesktopFolders(folders: DesktopFolderMap): void {
+  kvSet(DESKTOP_FOLDERS_STORAGE_KEY, JSON.stringify(folders));
 }
 
 // ── Dock layout ───────────────────────────────────────

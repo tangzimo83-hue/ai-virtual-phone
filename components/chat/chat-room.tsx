@@ -8,10 +8,15 @@ import { parseAIResponse, type ParsedMessagePart } from "@/lib/rich-message-pars
 import { isKnownStickerLabel } from "@/lib/sticker-data";
 import { translateReasoningText } from "@/lib/reasoning-translate";
 import { MessageBubble, MediaDetailModal, prewarmStickerCache, BilingualTextBlock, isStandaloneHtmlPreviewContent, normalizeTextBubbleContent } from "./message-bubble";
+import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 import { PhotoInputModal, TextPhotoModal, VoiceRecordModal, RedPacketModal, LocationInputModal, SystemInstructionModal } from "./rich-input-modals";
 import { EmojiPanel, StickerPanel } from "./emoji-panel";
+import { StickerSearchSuggest } from "./sticker-search-suggest";
 import { StateValuesPanel } from "./state-values-panel";
 import { generateChatCompletion, generateOfflineChatCompletion, flattenCompletionResult, ChatEngineError } from "@/lib/chat-engine";
+import { formatOfflineTurnXml as formatOfflineTurnXmlShared, buildOfflinePromptHistory as buildOfflinePromptHistoryShared } from "@/lib/offline-prompt-builder";
+import { getStatusRegionConfig, isCustomStatusRegionActive } from "@/lib/chat-status-region";
+import { CustomStatusFrame } from "@/components/chat/custom-status-frame";
 import { sendBrowserNotification } from "@/lib/browser-notification";
 import { dispatchChatMessageNotice } from "@/lib/chat-notification-events";
 import { shouldSendChatInputOnEnter } from "@/lib/chat-input-keyboard";
@@ -27,6 +32,7 @@ import { loadCustomAppChatPlusActions, type RegisteredCustomAppChatPlusAction } 
 import { CUSTOM_APPS_UPDATED_EVENT, getInstalledCustomApp } from "@/lib/custom-app-storage";
 import { toCustomAppIconId, type InstalledCustomApp } from "@/lib/custom-app-types";
 import { CustomAppRunner } from "@/components/app-market/custom-app-runner";
+import { CustomAppForegroundBoundary } from "@/components/app-market/custom-app-failure";
 
 import { ChatSettingsPanel } from "./chat-settings-panel";
 import { VoiceCallScreen } from "./voice-call-screen";
@@ -40,12 +46,14 @@ import { loadBindingConfig, loadRegexes, resolveBinding, resolveUserIdentity } f
 import { generateGroupChatCompletion, generateGroupOfflineChatCompletion, parseGroupChatResponse, buildEditableGroupRoundText } from "@/lib/group-chat-engine";
 import { appendChatOfflineTurn, deleteChatOfflineTurn, deleteChatOfflineTurnsFrom, loadChatOfflineTurns, parseOfflineResponse, saveChatOfflineTurns, updateChatOfflineTurn, type ChatOfflineTurn } from "@/lib/chat-offline-storage";
 import { applyDisplayRegex, applyEditRegex } from "@/lib/llm-prompt-assembler";
-import { scheduleFollowUp, cancelFollowUp } from "@/lib/follow-up-service";
+import { scheduleFollowUp, cancelFollowUp, cancelBackgroundGeneration, isBackgroundReplyGenerating } from "@/lib/follow-up-service";
+import { useKeyboardDismissAutoSend } from "@/components/chat/use-keyboard-dismiss-auto-send";
+import { cancelBailoutKey } from "@/lib/push-bailout-client";
 import { PENDING_REPLY_PREFIX } from "@/lib/friend-request-engine";
 import type { UserIdentity } from "@/components/settings/user-identity";
 import { AlertCircle, Blocks, Check, Trash2, User, ChevronLeft, ChevronRight, Clapperboard, Clock, Gift, Languages, Loader2, MoreHorizontal, X } from "lucide-react";
 import { setDebugChatState } from "@/lib/debug-store";
-import { scopeSessionCSS } from "@/lib/css-scoper";
+import { SessionCustomCSS } from "@/components/ui/session-custom-css";
 import { setChatActive } from "@/lib/music-action-queue";
 import { getMusicControlBridge } from "@/lib/music-control-bridge";
 import { findPlayableMatch, getNeteaseLyrics, getNeteaseSongDetail } from "@/lib/music-service";
@@ -243,7 +251,6 @@ function getChatFlowVisibleContent(msg: ChatMessage, displayContent?: string): s
 function isChatVisualMedia(msg: ChatMessage): boolean {
     return !!msg.mediaType && CHAT_VISUAL_MEDIA_TYPES.has(msg.mediaType);
 }
-
 /** 思维链触发条的单行摘要：取首个非空行并剥离 markdown 标记（**、`、# 等），避免星号原样显示 */
 function reasoningPreviewLine(text: string): string {
     for (const rawLine of text.split("\n")) {
@@ -449,6 +456,8 @@ function shouldShowTimestamp(currentMsg: string, prevMsg: string | null): boolea
 type ChatRoomProps = {
     session: ChatSession;
     onBack: () => void;
+    /** 会话在设置页被删除后回调：由外层卸载本聊天室并回到列表 */
+    onDeleted?: () => void;
 };
 
 type OfflineActionTarget = {
@@ -652,6 +661,8 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
 }, ref) {
     const [inputText, setInputText] = useState("");
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    // 表情包搜索联想：ESC/失焦置 true 隐藏，输入变化重新开启
+    const [suggestClosed, setSuggestClosed] = useState(false);
     // 围观群/被禁言：输入与富媒体入口全部锁定，只留线下切换和生成按钮
     const [muteNowTick, setMuteNowTick] = useState(() => Date.now());
     useEffect(() => {
@@ -700,6 +711,11 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     };
 
     const panelOpen = showEmojiPanel || showStickerPanel || showPlusMenu;
+    const suggestCharacterIds = useMemo(
+        () => (isGroup ? (stickerCharacterIds || []) : characterId ? [characterId] : []),
+        [isGroup, stickerCharacterIds, characterId],
+    );
+    const suggestEnabled = !inputLocked && !panelOpen && !suggestClosed && inputText.trim().length > 0;
     const plusMenuItems = [
         { icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--c-text)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></svg>, label: "照片墙", onClick: () => onOpenRichModal("photo") },
         { icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--c-text)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><line x1="7" y1="8" x2="17" y2="8" /><line x1="7" y1="12" x2="14" y2="12" /><line x1="7" y1="16" x2="11" y2="16" /></svg>, label: "文字图片", onClick: () => onOpenRichModal("text_photo") },
@@ -749,12 +765,21 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                 </div>
             )}
 
+            {suggestEnabled && (
+                <StickerSearchSuggest
+                    query={inputText}
+                    characterIds={suggestCharacterIds}
+                    onSend={(name, url) => onSendSticker(name, url)}
+                    onClose={() => setSuggestClosed(true)}
+                />
+            )}
             <textarea
                 ref={textareaRef}
                 rows={1}
                 value={inputText}
                 onChange={e => {
                     setInputText(e.target.value);
+                    setSuggestClosed(false);
                     e.target.style.height = "auto";
                     e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
                 }}
@@ -765,8 +790,14 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                         const target = e.target as HTMLTextAreaElement;
                         requestAnimationFrame(() => requestAnimationFrame(() => target.focus()));
                     }
+                    setSuggestClosed(false);
                 }}
+                onBlur={() => setSuggestClosed(true)}
                 onKeyDown={e => {
+                    if (e.key === "Escape") {
+                        setSuggestClosed(true);
+                        return;
+                    }
                     if (shouldSendChatInputOnEnter(e, enterToSendEnabled)) {
                         e.preventDefault();
                         handleSubmit();
@@ -1025,7 +1056,7 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
     );
 }));
 
-export function ChatRoom({ session, onBack }: ChatRoomProps) {
+export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const [liveCSS, setLiveCSS] = useState(session.customCSS || "");
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [transientMessages, setTransientMessages] = useState<ChatMessage[]>([]);
@@ -1049,6 +1080,8 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
     const [pendingGenerate, setPendingGenerate] = useState(false);
     const [chatToast, setChatToast] = useState<string | null>(null);
     const chatToastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+    // 自动生图失败：弹一次弹窗提示，关掉即消失（同一轮里多张失败只提示第一条）
+    const [imageGenerationFailure, setImageGenerationFailure] = useState<string | null>(null);
     const [cloudDeletePending, setCloudDeletePending] = useState<{ count: number } | null>(null);
     const [showPlusMenu, setShowPlusMenu] = useState(false);
     const [customPlusActions, setCustomPlusActions] = useState<RegisteredCustomAppChatPlusAction[]>(() => loadCustomAppChatPlusActions());
@@ -1417,6 +1450,11 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         window.addEventListener("followup-started", onStarted);
         window.addEventListener("followup-message-saved", onMessageSaved);
         window.addEventListener("followup-fired", onFired);
+        // 生成中途才进入聊天室会错过 followup-started 事件，
+        // 挂载时主动查一次后台生成状态，把「正在输入」补回来
+        if (isBackgroundReplyGenerating(session.id)) {
+            setIsGenerating(true);
+        }
         return () => {
             window.removeEventListener("followup-started", onStarted);
             window.removeEventListener("followup-message-saved", onMessageSaved);
@@ -2410,6 +2448,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                     responseRoundId,
                     editableResponseText,
                     statusPanel: attachHere && statusPanel ? statusPanel : undefined,
+                    statusRegionMode: customStatusActive && attachHere && statusPanel ? "custom" as const : undefined,
                     innerMonologue: attachHere && innerMonologue ? innerMonologue : undefined,
                     reasoningText: takeRoundReasoning(),
                     stateValues: attachHere && stateValues.length > 0 ? stateValues : undefined,
@@ -2446,6 +2485,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                     responseRoundId,
                     editableResponseText,
                     statusPanel,
+                    statusRegionMode: customStatusActive && statusPanel ? "custom" as const : undefined,
                     innerMonologue,
                     reasoningText: takeRoundReasoning(),
                     stateValues: stateValues.length > 0 ? stateValues : undefined,
@@ -2530,6 +2570,8 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
 
     const clearStuckGeneration = () => {
         const cancelledRun = cancelGenerationRun(session.id);
+        cancelBackgroundGeneration(session.id);
+        cancelBailoutKey(`reply:${session.id}`);
         if (cancelledRun?.pendingNativeToolCalls.length) {
             for (const call of cancelledRun.pendingNativeToolCalls) {
                 pushChatMessage({
@@ -2610,6 +2652,8 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
             .catch(error => {
                 if (!isAbortLikeError(error)) {
                     console.warn("[ImageGeneration] Failed to generate chat image:", error);
+                    const reason = error instanceof Error ? error.message : String(error);
+                    setImageGenerationFailure(prev => prev ?? reason);
                 }
                 return null;
             });
@@ -2733,6 +2777,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                     responseBatchId,
                     rawResponseText,
                     statusPanel,
+                    statusRegionMode: customStatusActive && statusPanel ? "custom" as const : undefined,
                     innerMonologue,
                     reasoningText: options?.reasoningText,
                     stateValues: stateValues.length > 0 ? stateValues : undefined,
@@ -2765,6 +2810,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                 responseBatchId,
                 rawResponseText,
                 statusPanel: idx === metaIdx && statusPanel ? statusPanel : undefined,
+                statusRegionMode: customStatusActive && idx === metaIdx && statusPanel ? "custom" as const : undefined,
                 innerMonologue: idx === metaIdx && innerMonologue ? innerMonologue : undefined,
                 reasoningText: idx === metaIdx ? options?.reasoningText : undefined,
                 stateValues: idx === metaIdx && stateValues.length > 0 ? stateValues : undefined,
@@ -3403,6 +3449,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                 responseRoundId,
                                 editableResponseText,
                                 statusPanel: !attachedState && statusPanel ? statusPanel : undefined,
+                                statusRegionMode: customStatusActive && !attachedState && statusPanel ? "custom" as const : undefined,
                                 innerMonologue: !attachedState && innerMonologue ? innerMonologue : undefined,
                                 reasoningText: !attachedState ? roundReasoning : undefined,
                                 stateValues: !attachedState && stateValues.length > 0 ? stateValues : undefined,
@@ -3429,6 +3476,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                 responseRoundId,
                                 editableResponseText,
                                 statusPanel,
+                                statusRegionMode: customStatusActive && statusPanel ? "custom" as const : undefined,
                                 innerMonologue,
                                 reasoningText: roundReasoning,
                                 stateValues: stateValues.length > 0 ? stateValues : undefined,
@@ -3630,6 +3678,17 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         if (shouldRunDeclineReply) await triggerReply();
     };
 
+    // 收起键盘（或关掉表情/加号面板）并安静 N 秒后自动触发回复，
+    // 等价于替用户点一次「触发回复」。判定全在 hook 内部，配置关掉后与手动模式一致。
+    useKeyboardDismissAutoSend(wrapperRef, {
+        active: !offlineMode && !isMultiSelectMode,
+        pending: pendingGenerate,
+        generating: isGenerating,
+        panelOpen: showEmojiPanel || showStickerPanel || showPlusMenu,
+        sessionId: session.id,
+        onTrigger: () => { void triggerAIResponse(); },
+    });
+
     useEffect(() => {
         const handleCustomAppReplyRequest = (event: Event) => {
             const detail = (event as CustomEvent<{
@@ -3740,58 +3799,16 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         return true;
     };
 
-    const formatOfflineTurnXml = useCallback((turn: ChatOfflineTurn): string => {
-        if (turn.rawText?.trim()) return turn.rawText.trim();
-        const summaryTag = turn.summaryTag?.trim() || "summary";
-        return [
-            "<content>",
-            turn.assistantContent,
-            "</content>",
-            `<${summaryTag}>`,
-            turn.summary,
-            `</${summaryTag}>`,
-        ].join("\n");
-    }, []);
+    // 线下 XML 构造与提示词查看器共用 lib/offline-prompt-builder（社区 #108），
+    // 保证「预览 = 真实发出的提示词」；此处仅包一层稳定引用。
+    // 自定义状态栏：custom 生效时新消息盖戳，折叠区改走用户渲染代码；旧消息按原生渲染
+    const statusRegionCfg = getStatusRegionConfig(session.id);
+    const customStatusActive = isCustomStatusRegionActive(statusRegionCfg);
 
-    const buildOfflinePromptHistory = (turns: ChatOfflineTurn[], pendingUserContent: string): ChatMessage[] => {
-        const history: ChatMessage[] = [];
-        for (const turn of turns) {
-            const assistantAt = turn.createdAt;
-            const userAtMs = new Date(turn.createdAt).getTime() - 1;
-            const userAt = Number.isFinite(userAtMs) ? new Date(userAtMs).toISOString() : turn.createdAt;
-            if (turn.userContent.trim()) {
-                history.push({
-                    id: `${turn.id}_user`,
-                    sessionId: session.id,
-                    role: "user",
-                    content: turn.userContent,
-                    status: "sent",
-                    createdAt: userAt,
-                });
-            }
-            history.push({
-                id: `${turn.id}_assistant`,
-                sessionId: session.id,
-                role: "assistant",
-                content: formatOfflineTurnXml(turn),
-                status: "sent",
-                createdAt: assistantAt,
-                ...(session.isGroup ? { senderName: session.groupName || "群聊线下" } : {}),
-            });
-        }
-        if (pendingUserContent.trim()) {
-            history.push({
-                id: `offline_pending_${Date.now()}`,
-                sessionId: session.id,
-                role: "user",
-                content: pendingUserContent.trim(),
-                status: "sent",
-                createdAt: new Date().toISOString(),
-            });
-        }
-        return history;
-    };
+    const formatOfflineTurnXml = useCallback((turn: ChatOfflineTurn): string => formatOfflineTurnXmlShared(turn), []);
 
+    const buildOfflinePromptHistory = (turns: ChatOfflineTurn[], pendingUserContent: string): ChatMessage[] =>
+        buildOfflinePromptHistoryShared(session, turns, pendingUserContent);
     const getOfflineCopyText = (turn: ChatOfflineTurn, role: OfflineActionTarget["role"]): string => {
         if (role === "user") return turn.userContent;
         return formatOfflineTurnXml(turn);
@@ -4110,7 +4127,8 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         setEditingResponseRoundId(null);
         setEditingResponseContent("");
         setEditingMessageId(msg.id);
-        setEditingContent(msg.content);
+        // 语音条的文字存在 mediaData.label 里，content 是空的
+        setEditingContent(msg.mediaType === "audio" ? (msg.mediaData?.label || msg.content) : msg.content);
         setActiveMessageId(null);
     };
 
@@ -4127,8 +4145,16 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         const nextContent = isEditingSystemInstruction
             ? editingContent.trim()
             : applyEditTextRegex(editingContent.trim(), placement, false);
-        editChatMessage(editingMessageId, nextContent);
-        setMessages(prev => prev.map(m => m.id === editingMessageId ? { ...m, content: nextContent } : m));
+        if (originalMessage?.mediaType === "audio") {
+            // 语音条的显示文字和 AI 上下文都读 mediaData.label，改 content 不生效；
+            // synthesizedFromText 保留旧值，AI 语音会因文字不一致自动重新合成
+            const nextMediaData = { ...originalMessage.mediaData, label: nextContent };
+            updateMessageMediaData(editingMessageId, nextMediaData);
+            setMessages(prev => prev.map(m => m.id === editingMessageId ? { ...m, mediaData: nextMediaData } : m));
+        } else {
+            editChatMessage(editingMessageId, nextContent);
+            setMessages(prev => prev.map(m => m.id === editingMessageId ? { ...m, content: nextContent } : m));
+        }
         setEditingMessageId(null);
         setEditingContent("");
         const ta = document.querySelector<HTMLTextAreaElement>(".chat-input-textarea");
@@ -4264,6 +4290,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                 rawResponseText?: string;
                 responseBatchId?: string;
                 statusPanel?: string;
+                statusRegionMode?: "custom";
                 innerMonologue?: string;
                 stateValues?: StateValue[];
                 freshStateValues?: StateValue[];
@@ -4298,6 +4325,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                         rawResponseText: segment.responseText,
                         responseBatchId,
                         statusPanel: attachHere && statusPanel ? statusPanel : undefined,
+                        statusRegionMode: customStatusActive && attachHere && statusPanel ? "custom" as const : undefined,
                         innerMonologue: attachHere && innerMonologue ? innerMonologue : undefined,
                         stateValues: attachHere && stateValues.length > 0 ? stateValues : undefined,
                         freshStateValues: attachHere ? freshStateValues : undefined,
@@ -4312,6 +4340,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                         rawResponseText: segment.responseText,
                         responseBatchId,
                         statusPanel,
+                        statusRegionMode: customStatusActive && statusPanel ? "custom" as const : undefined,
                         innerMonologue,
                         stateValues: stateValues.length > 0 ? stateValues : undefined,
                         freshStateValues,
@@ -4399,6 +4428,10 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
             }
         }
 
+        // 编辑只改文字，不改这批消息生成时所处的状态栏模式——沿用原戳，
+        // 否则编辑一次就退回原生渲染，而且切回原生后再编辑又会反向串档。
+        const originalStatusRegionMode = batchMessages.find(m => m.statusRegionMode === "custom")?.statusRegionMode;
+
         replaceResponseBatchWithParts(
             session.id,
             editingResponseBatchId,
@@ -4406,6 +4439,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
             normalizedParts,
             {
                 statusPanel,
+                statusRegionMode: originalStatusRegionMode,
                 innerMonologue,
                 stateValues: stateValues.length > 0 ? stateValues : undefined,
                 freshStateValues,
@@ -4510,7 +4544,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         if (!targetMsg) return;
         void deleteWeixinCloudBeforeLocal([targetMsg], () => {
             deleteChatMessage(msgId);
-            setMessages(prev => prev.filter(m => m.id !== msgId));
+            syncMessagesFromStorage();
         });
     };
 
@@ -4532,10 +4566,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         ));
         void deleteWeixinCloudBeforeLocal(targetMessages, () => {
             deleteChatMessagesFrom(msgId);
-            setMessages(prev => {
-                const idx = prev.findIndex(m => m.id === msgId);
-                return idx >= 0 ? prev.slice(0, idx) : prev;
-            });
+            syncMessagesFromStorage();
         });
     };
 
@@ -4563,8 +4594,13 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         return wrapperRef.current ? createPortal(menu, wrapperRef.current) : menu;
     };
 
+    const getStoredActionMessageId = (msg: ChatMessage | RenderChatMessage): string => {
+        return "displaySourceId" in msg && msg.displaySourceId ? msg.displaySourceId : msg.id;
+    };
+
     /** Reusable context menu for user/assistant bubbles */
     const renderBubbleContextMenu = (m: ChatMessage, options?: { allowMultiSelect?: boolean }) => {
+        const storedMessageId = getStoredActionMessageId(m);
         const menu = (
             <div
                 onPointerDown={e => e.stopPropagation()}
@@ -4599,10 +4635,10 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                         <button onClick={() => { setVoiceTextIds(prev => { const next = new Set(prev); if (next.has(m.id)) next.delete(m.id); else next.add(m.id); return next; }); setActiveMessageId(null); }} className="ctx-menu-btn">转文字</button>
                     )}
                     {m.role === "user" && (
-                        <button onClick={() => handleRetractMessage(m.id)} className="ctx-menu-btn">撤回消息</button>
+                        <button onClick={() => handleRetractMessage(storedMessageId)} className="ctx-menu-btn">撤回消息</button>
                     )}
                     {m.role === "assistant" && (
-                        <button onClick={() => handleRetry(m.id)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
+                        <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
                     )}
                 </div>
                 <div className="flex">
@@ -4610,8 +4646,8 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                     {options?.allowMultiSelect !== false && (
                         <button onClick={() => startMultiSelectFromMessage(m)} className="ctx-menu-btn">多选</button>
                     )}
-                    <button onClick={() => handleDeleteMessage(m.id)} className="ctx-menu-btn ctx-menu-btn-danger">删除</button>
-                    <button onClick={() => handleDeleteMessagesFrom(m.id)} className="ctx-menu-btn ctx-menu-btn-danger">删除以下</button>
+                    <button onClick={() => handleDeleteMessage(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">删除</button>
+                    <button onClick={() => handleDeleteMessagesFrom(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">删除以下</button>
                 </div>
                 {(() => {
                     // 聊天插件注册的消息操作菜单项
@@ -4670,6 +4706,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
     };
 
     const renderSystemContextMenu = (msg: ChatMessage) => {
+        const storedMessageId = getStoredActionMessageId(msg);
         if (isSystemInstructionMessage(msg)) {
             const instructionMenu = (
                 <div
@@ -4693,7 +4730,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                     >编辑</button>
                     <button
                         onClick={() => {
-                            handleDeleteMessage(msg.id);
+                            handleDeleteMessage(storedMessageId);
                             closeContextMenu();
                         }}
                         className="ctx-menu-btn ctx-menu-btn-danger"
@@ -4737,7 +4774,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                 >多选</button>
                 <button
                     onClick={() => {
-                        handleDeleteMessage(msg.id);
+                        handleDeleteMessage(storedMessageId);
                         closeContextMenu();
                     }}
                     className="ctx-menu-btn ctx-menu-btn-danger"
@@ -4807,6 +4844,11 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                 const id = index < batch.length ? sourceId : `${batch[0].id}__display_${index}`;
                 const isMetaSlot = index === displayMetaIdx;
                 const statusPanelHere = isMetaSlot ? (parsed.statusPanel || storedMeta?.statusPanel) : undefined;
+                // 面板从 storedMeta 挪到了别的槽位，戳要跟着面板走：光靠 ...base 展开会取到
+                // 槽位那条消息的戳（多半是空的），投影后状态栏就退回原生渲染了。
+                const statusRegionModeHere = isMetaSlot && statusPanelHere
+                    ? (storedMeta?.statusRegionMode ?? base.statusRegionMode)
+                    : undefined;
                 const innerMonologueHere = isMetaSlot ? (parsed.innerMonologue || storedMeta?.innerMonologue) : undefined;
                 const reasoningTextHere = isMetaSlot ? storedMeta?.reasoningText : undefined;
                 const stateValuesHere = isMetaSlot ? storedMeta?.stateValues : undefined;
@@ -4814,13 +4856,20 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                 if (isMetaSlot && (statusPanelHere || innerMonologueHere || reasoningTextHere || (stateValuesHere && stateValuesHere.length > 0))) {
                     metaProjected = true;
                 }
+                // 语音条的 mediaData 里存着播放必需的状态（synthesizedFromText/voiceDuration），
+                // 直接用重解析结果整体替换会把它们丢掉，导致气泡永远判定"待重合成"而点不响。
+                // 双方都是语音条时按存储值打底、重解析字段覆盖。
+                const mediaData = part.mediaType === "audio" && base.mediaType === "audio" && base.mediaData
+                    ? { ...base.mediaData, ...part.mediaData }
+                    : part.mediaData;
                 projected.push({
                     ...base,
                     id,
                     content: part.content,
                     mediaType: part.mediaType,
-                    mediaData: part.mediaData,
+                    mediaData,
                     statusPanel: statusPanelHere,
+                    statusRegionMode: statusRegionModeHere,
                     innerMonologue: innerMonologueHere,
                     reasoningText: reasoningTextHere,
                     stateValues: stateValuesHere,
@@ -5106,7 +5155,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
         <div ref={wrapperRef} className={`session-${session.id} chat-room-wrapper page-shell inset-0 flex flex-col z-20`} style={chatRoomBackgroundStyle} {...(bgLoading ? { "data-loading": "" } : {})} {...(bgImageResolved ? { "data-has-bg-image": "" } : {})} {...(showSettings ? { "data-settings-open": "" } : {})}>
             {/* Custom CSS Injection for this session — scoped to prevent leaking */}
             {liveCSS && (
-                <style dangerouslySetInnerHTML={{ __html: scopeSessionCSS(liveCSS, `.session-${session.id}`) }} />
+                <SessionCustomCSS css={liveCSS} scope={`.session-${session.id}`} />
             )}
 
             {/* 全屏特效层（表情雨/礼花），不拦截任何触摸操作 */}
@@ -5409,7 +5458,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                                         {...(activeMessageId === gMsg.id ? { "data-active": "" } : {})}
                                                     >
                                                         {formatSysMsgForUI(gMsg.content, gMsg)}
-                                                        {activeMessageId === gMsg.id && renderDeleteOnlyContextMenu(() => handleDeleteMessage(gMsg.id))}
+                                                        {activeMessageId === gMsg.id && renderDeleteOnlyContextMenu(() => handleDeleteMessage(getStoredActionMessageId(gMsg)))}
                                                     </div>
                                                 </div>
                                             ) : (
@@ -5599,7 +5648,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                         {...(activeMessageId === msg.id ? { "data-active": "" } : {})}
                                     >
                                         {msg.role === "user" ? "你" : (character?.name || "对方")}撤回了一条消息
-                                        {activeMessageId === msg.id && renderDeleteOnlyContextMenu(() => handleDeleteMessage(msg.id), () => startMultiSelectFromMessage(msg))}
+                                        {activeMessageId === msg.id && renderDeleteOnlyContextMenu(() => handleDeleteMessage(getStoredActionMessageId(msg)), () => startMultiSelectFromMessage(msg))}
                                     </div>
                                 ) : (
                                     <>
@@ -5630,7 +5679,7 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                                     {...(activeMessageId === msg.id ? { "data-active": "" } : {})}
                                                 >
                                                     <span className="chat-monologue-heart ts-18 leading-none inline-block" {...(expandedMonologueId === msg.id ? { "data-active": "" } : {})}><svg viewBox="0 0 16 16" width="18" height="18" style={{display:"block"}}><path d="M8 14s-6-4-6-8c0-2.5 1.5-4 3.5-4 1 0 2 .5 2.5 1.5C8.5 2.5 9.5 2 10.5 2 12.5 2 14 3.5 14 6c0 4-6 8-6 8z" fill="currentColor"/></svg></span>
-                                                    {activeMessageId === msg.id && renderDeleteOnlyContextMenu(() => handleDeleteMessage(msg.id), () => startMultiSelectFromMessage(msg))}
+                                                    {activeMessageId === msg.id && renderDeleteOnlyContextMenu(() => handleDeleteMessage(getStoredActionMessageId(msg)), () => startMultiSelectFromMessage(msg))}
                                                 </div>
                                             ) : (
                                                 <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
@@ -5751,30 +5800,42 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                                     {msg.role === "user" && <div className="w-[40px] shrink-0" />}
                                 </div>
                             )}
-                            {/* Thought chain card (sticky note / journal style) */}
-                            {hasFoldedPanel && expandedMonologueId === msg.id && (
+                            {/* 状态栏：一律裸渲染，不套便利贴外框（自定义模式下交给用户的渲染代码，
+                                否则 [状态栏] 原文直接走 markdown/内联 HTML，让 AI 直出的卡片自己当外框）。
+                                状态值跟内心独白走（留在便利贴里）；这轮没有内心独白时便利贴不出现，
+                                数值裸放在状态栏上方。 */}
+                            {hasFoldedPanel && expandedMonologueId === msg.id
+                                && (renderMsg.statusPanel || (!renderMsg.innerMonologue && cardStateValues && cardStateValues.length > 0)) && (
+                                <div className="chat-status-bare">
+                                    {!renderMsg.innerMonologue && cardStateValues && cardStateValues.length > 0 && (
+                                        <StateValuesPanel stateValues={cardStateValues} />
+                                    )}
+                                    {renderMsg.statusPanel && (
+                                        msg.statusRegionMode === "custom" && statusRegionCfg.renderHtml.trim() ? (
+                                            <CustomStatusFrame html={statusRegionCfg.renderHtml} raw={renderMsg.statusPanel} />
+                                        ) : (
+                                            <BilingualTextBlock text={msg.displayProjected ? renderMsg.statusPanel : renderDisplayText(renderMsg.statusPanel, 6, false)} mode="markdown" defaultExpanded={session.collapseBilingualTranslation !== false ? false : true} />
+                                        )
+                                    )}
+                                </div>
+                            )}
+                            {/* Inner monologue card (sticky note / journal style) */}
+                            {hasFoldedPanel && expandedMonologueId === msg.id && renderMsg.innerMonologue && (
                                 <div className="chat-thought-card">
                                     {/* Decorative washi tape */}
                                     <div className="chat-thought-tape-left" />
                                     <div className="chat-thought-tape-right" />
                                     {/* Title */}
                                     <div className="chat-thought-title">
-                                        💭 {renderMsg.innerMonologue ? "内心独白" : "状态栏"}
+                                        💭 内心独白
                                     </div>
                                     {/* State values panel */}
                                     {cardStateValues && cardStateValues.length > 0 && (
                                         <StateValuesPanel stateValues={cardStateValues} />
                                     )}
-                                    {renderMsg.statusPanel && (
-                                        <div className="chat-thought-body">
-                                            <BilingualTextBlock text={msg.displayProjected ? renderMsg.statusPanel : renderDisplayText(renderMsg.statusPanel, 6, false)} mode="markdown" defaultExpanded={session.collapseBilingualTranslation !== false ? false : true} />
-                                        </div>
-                                    )}
-                                    {renderMsg.innerMonologue && (
-                                        <div className="chat-thought-body">
-                                            <BilingualTextBlock text={msg.displayProjected ? renderMsg.innerMonologue : renderDisplayText(renderMsg.innerMonologue, 6, false)} mode="markdown" defaultExpanded={session.collapseBilingualTranslation !== false ? false : true} />
-                                        </div>
-                                    )}
+                                    <div className="chat-thought-body">
+                                        <BilingualTextBlock text={msg.displayProjected ? renderMsg.innerMonologue : renderDisplayText(renderMsg.innerMonologue, 6, false)} mode="markdown" defaultExpanded={session.collapseBilingualTranslation !== false ? false : true} />
+                                    </div>
                                     {/* Signature */}
                                     <div className="chat-thought-sig">
                                         — {session.isGroup ? (msg.senderName || "群成员") : (character?.name || "TA")}
@@ -5914,6 +5975,10 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                             showChatToast("已清空线下聊天记录");
                         }}
                         onDeleteFriend={() => onBack()}
+                        onSessionDeleted={() => {
+                            setShowSettings(false);
+                            (onDeleted ?? onBack)();
+                        }}
                     />
                 </div>,
                 wrapperRef.current.parentElement
@@ -5964,13 +6029,23 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                             </button>
                         </div>
                         <div className="chat-custom-app-body">
-                            <CustomAppRunner
-                                app={activeCustomChatPlus.app}
-                                launchContext={activeCustomChatPlus.launchContext}
-                                embedded
+                            <CustomAppForegroundBoundary
+                                key={activeCustomChatPlus.app.id}
+                                appName={activeCustomChatPlus.app.name}
+                                appId={activeCustomChatPlus.app.id}
+                                appVersion={activeCustomChatPlus.app.version}
+                                manifestId={activeCustomChatPlus.app.manifest?.id}
+                                closeLabel="返回聊天"
                                 onClose={() => setActiveCustomChatPlus(null)}
-                                onNotice={showChatToast}
-                            />
+                            >
+                                <CustomAppRunner
+                                    app={activeCustomChatPlus.app}
+                                    launchContext={activeCustomChatPlus.launchContext}
+                                    embedded
+                                    onClose={() => setActiveCustomChatPlus(null)}
+                                    onNotice={showChatToast}
+                                />
+                            </CustomAppForegroundBoundary>
                         </div>
                     </div>
                 </div>
@@ -6301,6 +6376,13 @@ export function ChatRoom({ session, onBack }: ChatRoomProps) {
                         </div>
                     </div>
                 </div>
+            )}
+
+            {imageGenerationFailure && (
+                <GeneratedImageErrorDialog
+                    message={imageGenerationFailure}
+                    onClose={() => setImageGenerationFailure(null)}
+                />
             )}
 
             {/* Chat toast notification (overlay, does not affect layout) */}

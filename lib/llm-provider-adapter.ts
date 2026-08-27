@@ -6,6 +6,7 @@ import {
     determineBaseUrl,
     isNativeAnthropicApi,
     isNativeGoogleApi,
+    stripHallucinatedTimestamps,
 } from "./api-helpers";
 
 export type LlmProviderKind = "openai-compatible" | "anthropic" | "gemini";
@@ -37,6 +38,8 @@ export type LlmRequestPayload = {
     body: Record<string, unknown>;
     providerKind: LlmProviderKind;
     messagesForLog: { role: string; content: string | LLMContentPart[]; marker?: string }[];
+    /** 需要经本站 /api/llm-proxy 服务端转发（OpenCode 网关未开放浏览器 CORS 时置 true） */
+    serverProxy?: boolean;
 };
 
 export type LlmParsedResponse = {
@@ -66,6 +69,8 @@ export type LlmToolCallDelta = {
 type ProviderRequestOptions = {
     stream?: boolean;
     tools?: LlmToolDefinition[];
+    /** 单次最大输出 token：按调用覆盖预设值（工坊输出护栏用）。不填则沿用预设/各家默认 */
+    maxTokens?: number;
 };
 
 const ANTHROPIC_AUTO_MAX_TOKENS = 8192;
@@ -261,13 +266,9 @@ export function buildProviderRequest(
     return buildOpenAICompatibleRequest(config, preset, baseUrl, providerMessages, options);
 }
 
-export function stripHallucinatedTimestamps(text: string): string {
-    // 括号内以完整日期时间开头的一律剥掉：兼容带秒、时区（Europe/Madrid、UTC+2）、
-    // 星期等尾巴与全角括号——prompt 给历史消息标注的时间带时区时，AI 会照格式模仿
-    return text
-        .replace(/[（(]\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?(?:\s+[^)）]*)?[)）]\s*/g, "")
-        .replace(/\(system\s*time\s*[:：][^)]*\)\s*/gi, "");
-}
+// 剥离逻辑收敛到 api-helpers（更底层，微信助手运行时也照抄同一份正则）；
+// 这里保留同名再导出，调用方无需改动。
+export { stripHallucinatedTimestamps };
 
 export function buildProviderDebugMessages(
     config: ApiConfig,
@@ -520,6 +521,7 @@ function buildOpenAICompatibleRequest(
         }),
         ...buildSamplingBody(preset),
     };
+    if (options.maxTokens && options.maxTokens > 0) body.max_tokens = Math.floor(options.maxTokens);
     if (options.stream) body.stream = true;
     if (options.tools?.length) {
         body.tools = options.tools.map((tool) => ({
@@ -563,7 +565,9 @@ function buildAnthropicRequest(
         model: config.defaultModel,
         messages: bodyMessages,
         temperature: preset?.temperature ?? 0.8,
-        max_tokens: preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? preset.openai_max_tokens : ANTHROPIC_AUTO_MAX_TOKENS,
+        max_tokens: options.maxTokens && options.maxTokens > 0
+            ? Math.floor(options.maxTokens)
+            : preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? preset.openai_max_tokens : ANTHROPIC_AUTO_MAX_TOKENS,
     };
     if (preset?.top_p !== undefined) body.top_p = preset.top_p;
     if (preset?.top_k && preset.top_k > 0) body.top_k = preset.top_k;
@@ -631,7 +635,9 @@ function buildGeminiRequest(
             temperature: preset?.temperature ?? 0.8,
             topP: preset?.top_p ?? 1,
             ...(preset?.top_k && preset.top_k > 0 ? { topK: preset.top_k } : {}),
-            ...(preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? { maxOutputTokens: preset.openai_max_tokens } : {}),
+            ...(options.maxTokens && options.maxTokens > 0
+                ? { maxOutputTokens: Math.floor(options.maxTokens) }
+                : preset?.openai_max_tokens && preset.openai_max_tokens > 0 ? { maxOutputTokens: preset.openai_max_tokens } : {}),
         },
         safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
